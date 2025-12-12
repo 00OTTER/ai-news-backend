@@ -9,7 +9,20 @@ import Parser from 'rss-parser';
 const { Pool } = pkg;
 
 const app = express();
-app.use(cors());
+
+// --- CORS Configuration (Critical for POST requests) ---
+const corsOptions = {
+    origin: '*', // In production, replace with your frontend domain if possible
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+    optionsSuccessStatus: 200
+};
+
+// Handle preflight requests for all routes
+app.options('*', cors(corsOptions));
+app.use(cors(corsOptions));
+
 app.use(express.json());
 
 // --- Graceful Shutdown ---
@@ -30,6 +43,7 @@ console.log(">>> ENVIRONMENT DIAGNOSTIC:");
 console.log(">>> Keys present:", Object.keys(process.env).filter(k => !k.startsWith('npm_')).join(', '));
 console.log(">>> Has API_KEY:", !!process.env.API_KEY);
 console.log(">>> Has DB URL:", !!CONNECTION_STRING);
+console.log(">>> CORS Policy: Allowed Authorization header");
 
 // 3. Initialize Status Card based on Config
 const getInitialStatus = () => {
@@ -103,6 +117,7 @@ if (CONNECTION_STRING) {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
           );
         `;
+        // Non-blocking schema init to avoid stalling startup
         pool.query(TABLE_SCHEMA)
             .then(() => console.log(">>> DB Schema Verified (Table 'briefings' ready)"))
             .catch(err => console.error(">>> DB Schema Error:", err.message));
@@ -299,12 +314,19 @@ app.get('/api/latest', async (req, res) => {
 });
 
 app.post('/api/trigger', async (req, res) => {
+    console.log(">>> TRIGGER REQUEST RECEIVED");
+    
     if (!process.env.API_KEY) return res.status(500).send("API_KEY missing");
-    if (req.headers['authorization'] !== process.env.API_KEY) return res.status(401).send("Unauthorized");
+    
+    const authHeader = req.headers['authorization'] || '';
+    if (authHeader.trim() !== process.env.API_KEY.trim()) {
+        console.log(">>> AUTH FAILED. Check API Key whitespace.");
+        return res.status(401).send("Unauthorized");
+    }
 
     const isMorning = new Date().getUTCHours() < 3;
     runJob(isMorning);
-    res.send("Job started. Check /api/debug for progress.");
+    res.send("Job started. Agent is scraping feeds... check back in 1 minute.");
 });
 
 const PORT = process.env.PORT || 3000;
