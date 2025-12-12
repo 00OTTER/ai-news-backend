@@ -137,11 +137,14 @@ const parser = new Parser({
     headers: { 'User-Agent': 'Mozilla/5.0 (Compatible; AI-News-Bot)' }
 });
 
+// Synced with frontend mirror list for better robustness
 const RSSHUB_MIRRORS = [
     'https://rsshub.app',
     'https://rsshub.feedlib.xyz',
     'https://rsshub.pseudoyu.com',
-    'https://rsshub.blue'
+    'https://rsshub.mou.science',
+    'https://rsshub.blue',
+    'https://rsshub.woodland.cafe'
 ];
 
 const SOURCES = [
@@ -223,7 +226,8 @@ async function generateBriefing(feedContext) {
     contents: feedContext + "\n\nGenerate the daily briefing based on the above.",
     config: { responseMimeType: 'application/json', systemInstruction: SYSTEM_INSTRUCTION }
   });
-  return response.text();
+  // FIX: Access text as property, not function
+  return response.text;
 }
 
 async function runJob(isMorning) {
