@@ -4,7 +4,7 @@ import express from 'express';
 import pkg from 'pg';
 import cron from 'node-cron';
 import cors from 'cors';
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import Parser from 'rss-parser';
 
 const { Pool } = pkg;
@@ -140,20 +140,50 @@ const SOURCES = [
    { name: 'Reddit StableDiffusion', url: 'https://rsshub.app/reddit/subreddit/StableDiffusion' }
 ];
 
-// UPDATED: Requested more items (20-30) and stricter date handling
+// UPDATED: Use Schema for stricter validation
 const SYSTEM_INSTRUCTION = `
 You are an expert AI News Aggregator. Analyze the RAW FEED DATA.
 Your goal is to provide COMPREHENSIVE coverage of the last 24 hours.
 Identify ALL significant AI stories (aim for 20-30 items if available).
-Generate a JSON array with fields: title (en/zh), summary (en/zh), category, url, source, impactScore (1-10), tags, date.
-Category options: LLMs, Image & Video, Hardware, Business, Research, Robotics.
+Generate a JSON array matching the provided schema.
 
 IMPORTANT RULES:
 1. FILTER STRICTLY: Do NOT include any news older than 24 hours. Check the "Date:" field.
 2. DATE ACCURACY: The "date" field in JSON MUST match the source "Date:" exactly.
 3. COMPREHENSIVE: Do not just pick the top 5. List all relevant news.
-4. STRUCTURE: Return valid JSON only.
 `;
+
+const RESPONSE_SCHEMA = {
+  type: Type.ARRAY,
+  items: {
+    type: Type.OBJECT,
+    properties: {
+      title: {
+        type: Type.OBJECT,
+        properties: {
+          en: { type: Type.STRING },
+          zh: { type: Type.STRING }
+        },
+        required: ["en", "zh"]
+      },
+      summary: {
+        type: Type.OBJECT,
+        properties: {
+          en: { type: Type.STRING },
+          zh: { type: Type.STRING }
+        },
+        required: ["en", "zh"]
+      },
+      category: { type: Type.STRING },
+      url: { type: Type.STRING },
+      source: { type: Type.STRING },
+      impactScore: { type: Type.NUMBER },
+      tags: { type: Type.ARRAY, items: { type: Type.STRING } },
+      date: { type: Type.STRING }
+    },
+    required: ["title", "summary", "category", "url", "source", "impactScore", "tags", "date"]
+  }
+};
 
 function cleanJson(text) {
   if (!text) return "[]";
@@ -198,14 +228,10 @@ async function fetchFeeds() {
           context += `--- SOURCE: ${source.name} ---\n`;
           let addedCount = 0;
           
-          // INCREASED LIMIT: Process up to 15 items per source to get "All News"
           feed.items.forEach(item => {
              const itemDateStr = item.pubDate || item.isoDate || item.date;
              let itemDate = itemDateStr ? new Date(itemDateStr) : null;
              
-             // STRICTER DATE CHECK:
-             // If date is invalid or missing, we skip it.
-             // We do NOT default to 'new Date()' anymore, as that incorrectly labels old news as "Today".
              if (!itemDate || isNaN(itemDate.getTime())) {
                  return; 
              }
@@ -235,7 +261,11 @@ async function generateBriefing(feedContext) {
   const response = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
     contents: feedContext + "\n\nGenerate the comprehensive daily feed based on the above. STRICTLY last 24 hours.",
-    config: { responseMimeType: 'application/json', systemInstruction: SYSTEM_INSTRUCTION }
+    config: { 
+        responseMimeType: 'application/json', 
+        responseSchema: RESPONSE_SCHEMA,
+        systemInstruction: SYSTEM_INSTRUCTION 
+    }
   });
   return response.text;
 }
@@ -247,7 +277,6 @@ async function runJob(isMorning) {
   
   try {
     const now = new Date();
-    // Use full date string as key to separate AM/PM if needed, or just date for daily
     const dateStr = now.toISOString().split('T')[0];
     const sessionKey = `${dateStr}-${isMorning ? 'AM' : 'PM'}`;
     
@@ -259,14 +288,21 @@ async function runJob(isMorning) {
     logJob("Gemini response received.");
     
     // 3. Parse
-    let parsedContent = JSON.parse(cleanJson(rawText));
+    // With responseSchema, output is almost guaranteed to be valid JSON.
+    // cleanJson is still used in case of rare markdown wrapping.
+    let parsedContent;
+    try {
+        parsedContent = JSON.parse(cleanJson(rawText));
+    } catch (parseErr) {
+        logJob(`JSON Parse Error: ${parseErr.message}`);
+        throw new Error(`Invalid JSON: ${parseErr.message}`);
+    }
+
     if(!Array.isArray(parsedContent)) throw new Error("Invalid JSON Array");
     
     // 3.5. Sanitize Data
     parsedContent = parsedContent.map((item, idx) => {
         let validDate = item.date;
-        // Keep the generation timestamp fallback ONLY if the AI returns strictly nothing.
-        // But since we filtered inputs, the AI *should* have valid dates.
         if (!validDate || isNaN(new Date(validDate).getTime())) {
             validDate = new Date().toISOString();
         }
