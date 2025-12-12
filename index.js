@@ -1,10 +1,12 @@
-require('dotenv').config();
-const express = require('express');
-const { Pool } = require('pg');
-const cron = require('node-cron');
-const cors = require('cors');
-const { GoogleGenAI } = require("@google/genai");
-const Parser = require('rss-parser');
+import 'dotenv/config';
+import express from 'express';
+import pg from 'pg';
+import cron from 'node-cron';
+import cors from 'cors';
+import { GoogleGenAI } from "@google/genai";
+import Parser from 'rss-parser';
+
+const { Pool } = pg;
 
 const app = express();
 app.use(cors());
@@ -17,6 +19,7 @@ const pool = new Pool({
 });
 
 // Initialize Table
+// Note: We use .then/.catch because top-level await is supported in ESM but better to be explicit in initialization logic
 pool.query(`
   CREATE TABLE IF NOT EXISTS briefings (
     date_key TEXT PRIMARY KEY, -- Format: YYYY-MM-DD-HH (to distinguish 8am vs 2pm)
