@@ -142,16 +142,18 @@ const SOURCES = [
 
 // UPDATED: Use Schema for stricter validation
 const SYSTEM_INSTRUCTION = `
-You are an expert AI News Aggregator. Analyze the RAW FEED DATA.
-Your goal is to provide COMPREHENSIVE coverage of the last 24 hours.
-Identify ALL significant AI stories (aim for 20-30 items if available).
-Generate a JSON array matching the provided schema.
+You are an expert AI News Aggregator and Analyst. 
+Analyze the RAW FEED DATA to provide comprehensive coverage of the last 24 hours.
 
 IMPORTANT RULES:
 1. FILTER STRICTLY: Do NOT include any news older than 24 hours. Check the "Date:" field.
 2. DATE ACCURACY: The "date" field in JSON MUST match the source "Date:" exactly.
 3. COMPREHENSIVE: Do not just pick the top 5. List all relevant news.
-4. FORMATTING: Ensure "impactScore" is a simple integer (1-10).
+4. **CONTENT DEPTH**: Summaries MUST be LONG, DETAILED, and INSIGHTFUL (approx 200 words / 300 Chinese characters). 
+   - Explain the technical details.
+   - Explain the business impact.
+   - Provide context on why this matters.
+5. FORMATTING: Ensure "impactScore" is a simple integer (1-10).
 `;
 
 const RESPONSE_SCHEMA = {
@@ -196,19 +198,21 @@ function cleanJson(text) {
     cleaned = codeBlockMatch[1].trim();
   }
   
-  // 2. Fallback: Robustly find the first '[' and last ']' to ignore preamble/postamble
-  // This fixes "Unexpected number" errors caused by text like "Here is the data: [...]"
+  // 2. Robustly find the first '[' and last ']'
   const firstOpen = cleaned.indexOf('[');
   const lastClose = cleaned.lastIndexOf(']');
   
   if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
       cleaned = cleaned.substring(firstOpen, lastClose + 1);
   } else {
-      // If no brackets found, it might be invalid, but let's return it and let JSON.parse fail with a clearer error
-      // or return empty array if it looks like just text.
-      if (!cleaned.startsWith('[')) return "[]";
+      // If we can't find a bracket, it's invalid.
+      return "[]";
   }
   
+  // 3. CRITICAL FIX: Remove trailing commas which break JSON.parse (common LLM error)
+  // Replaces ", ]" with "]" and ", }" with "}"
+  cleaned = cleaned.replace(/,(\s*[\]}])/g, '$1');
+
   return cleaned;
 }
 
@@ -274,10 +278,16 @@ async function generateBriefing(feedContext) {
   logJob("Calling Gemini API...");
   if (!process.env.API_KEY) throw new Error("API_KEY missing");
 
+  // Prevent payload too large errors
+  const MAX_CHARS = 60000;
+  const safeContext = feedContext.length > MAX_CHARS 
+    ? feedContext.substring(0, MAX_CHARS) + "\n...[TRUNCATED]" 
+    : feedContext;
+
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   const response = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
-    contents: feedContext + "\n\nGenerate the comprehensive daily feed based on the above. STRICTLY last 24 hours.",
+    contents: safeContext + "\n\nGenerate the comprehensive daily feed based on the above. STRICTLY last 24 hours.",
     config: { 
         responseMimeType: 'application/json', 
         responseSchema: RESPONSE_SCHEMA,
@@ -297,6 +307,21 @@ async function runJob(isMorning) {
     const dateStr = now.toISOString().split('T')[0];
     const sessionKey = `${dateStr}-${isMorning ? 'AM' : 'PM'}`;
     
+    // 0. Fetch EXISTING data for this session to append to
+    let existingItems = [];
+    if (pool) {
+        try {
+            const res = await pool.query('SELECT content FROM briefings WHERE date_key = $1', [sessionKey]);
+            if (res.rows.length > 0 && res.rows[0].content) {
+                const raw = res.rows[0].content;
+                existingItems = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                logJob(`Found ${existingItems.length} existing items for today. Appending new data...`);
+            }
+        } catch (err) {
+            console.error("Error fetching existing data:", err);
+        }
+    }
+
     // 1. Fetch
     const feedData = await fetchFeeds();
     
@@ -312,14 +337,14 @@ async function runJob(isMorning) {
         parsedContent = JSON.parse(cleanedText);
     } catch (parseErr) {
         logJob(`JSON Parse Error: ${parseErr.message}`);
-        logJob(`Faulty Text Snippet: ${cleanedText.substring(0, 100)}...`); // Log start of text for debug
+        logJob(`Faulty Text Snippet: ${cleanedText.substring(0, 100)}...`); 
         throw new Error(`Invalid JSON: ${parseErr.message}`);
     }
 
     if(!Array.isArray(parsedContent)) throw new Error("Invalid JSON Array");
     
-    // 3.5. Sanitize Data
-    parsedContent = parsedContent.map((item, idx) => {
+    // 3.5. Sanitize New Data
+    const sanitizedNewContent = parsedContent.map((item, idx) => {
         let validDate = item.date;
         if (!validDate || isNaN(new Date(validDate).getTime())) {
             validDate = new Date().toISOString();
@@ -330,17 +355,33 @@ async function runJob(isMorning) {
             date: validDate,
             title: (typeof item.title === 'string') ? { en: item.title, zh: item.title } : item.title,
             summary: (typeof item.summary === 'string') ? { en: item.summary, zh: item.summary } : item.summary,
+            impactScore: Number(item.impactScore) || 5
         };
     });
 
-    inMemoryCache = parsedContent;
-    logJob(`Memory cache updated (${parsedContent.length} items).`);
+    // 4. MERGE & DEDUPLICATE
+    // We prioritize NEW items on top, but remove duplicates based on URL or English Title
+    const mergedContent = [...sanitizedNewContent, ...existingItems];
+    const seenKeys = new Set();
+    const uniqueContent = [];
+    
+    for (const item of mergedContent) {
+        // Create a unique key for deduplication
+        const key = item.url ? item.url : (item.title?.en || JSON.stringify(item.title));
+        if (!seenKeys.has(key)) {
+            seenKeys.add(key);
+            uniqueContent.push(item);
+        }
+    }
+
+    inMemoryCache = uniqueContent;
+    logJob(`Memory cache updated (Total: ${uniqueContent.length} items).`);
 
     if (pool) {
         await pool.query(
           `INSERT INTO briefings (date_key, display_date, content) VALUES ($1, $2, $3) 
            ON CONFLICT (date_key) DO UPDATE SET content = $3, created_at = CURRENT_TIMESTAMP`,
-          [sessionKey, dateStr, JSON.stringify(parsedContent)]
+          [sessionKey, dateStr, JSON.stringify(uniqueContent)]
         );
         logJob("Saved to DB successfully.");
     }
