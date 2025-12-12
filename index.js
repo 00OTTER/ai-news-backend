@@ -22,32 +22,51 @@ process.on('SIGTERM', () => {
 let pool = null;
 let jobHistory = []; 
 
-// 1. Determine Database URL (Support both standard names)
+// 1. Determine Database URL
 const CONNECTION_STRING = process.env.DATABASE_URL || process.env.POSTGRES_URL;
 
-// 2. Startup Diagnostic (Helps user see if vars are actually injected)
+// 2. Startup Diagnostic
 console.log(">>> ENVIRONMENT DIAGNOSTIC:");
 console.log(">>> Keys present:", Object.keys(process.env).filter(k => !k.startsWith('npm_')).join(', '));
 console.log(">>> Has API_KEY:", !!process.env.API_KEY);
 console.log(">>> Has DB URL:", !!CONNECTION_STRING);
 
-// DEFAULT STATE
-let inMemoryCache = [
-    {
-        id: 'sys-status',
-        title: { en: "⚠️ SYSTEM STATUS: Database Not Connected", zh: "⚠️ 系统状态：未连接数据库" },
-        summary: { 
-            en: "The backend is running in 'Memory Mode'. If you have added DATABASE_URL to Railway, you MUST Redeploy the service for it to take effect. Check the Railway Build/Deploy logs to see the 'ENVIRONMENT DIAGNOSTIC' output.", 
-            zh: "后端运行在“内存模式”。如果您已经在 Railway 添加了 DATABASE_URL，请务必“重新部署 (Redeploy)”服务以使其生效。请检查 Railway 的部署日志查看“ENVIRONMENT DIAGNOSTIC”输出。" 
-        },
-        category: "System",
-        url: "#",
-        source: "System",
-        date: new Date().toISOString(),
-        impactScore: 10,
-        tags: ["Config Required", "Action Needed"]
+// 3. Initialize Status Card based on Config
+const getInitialStatus = () => {
+    if (CONNECTION_STRING) {
+        return [{
+            id: 'sys-connected-waiting',
+            title: { en: "🟢 System Online - Database Connected", zh: "🟢 系统在线 - 数据库已连接" },
+            summary: { 
+                en: "Success! The backend is connected to PostgreSQL. The list is currently empty because the AI Job hasn't run yet. Click 'TRIGGER CLOUD UPDATE' above to scrape news immediately.", 
+                zh: "连接成功！后端已连接到 PostgreSQL 数据库。当前列表为空是因为 AI 任务尚未运行。请点击上方的“触发云端更新”按钮立即开始抓取新闻。" 
+            },
+            category: "System",
+            url: "#",
+            source: "System",
+            date: new Date().toISOString(),
+            impactScore: 1,
+            tags: ["Ready", "Waiting for Trigger"]
+        }];
+    } else {
+        return [{
+            id: 'sys-missing-db',
+            title: { en: "⚠️ SYSTEM ALERT: Database Not Configured", zh: "⚠️ 系统警告：未配置数据库" },
+            summary: { 
+                en: "The backend is running but cannot find DATABASE_URL. Data will be lost on restart. Please check Railway Variables.", 
+                zh: "后端正在运行但未找到 DATABASE_URL 环境变量。重启后数据将丢失。请检查 Railway 变量设置。" 
+            },
+            category: "System",
+            url: "#",
+            source: "System",
+            date: new Date().toISOString(),
+            impactScore: 10,
+            tags: ["Config Error"]
+        }];
     }
-];
+};
+
+let inMemoryCache = getInitialStatus();
 
 function logJob(message) {
     const entry = `[${new Date().toISOString().split('T')[1].split('.')[0]}] ${message}`;
@@ -88,18 +107,18 @@ if (CONNECTION_STRING) {
             .then(() => console.log(">>> DB Schema Verified (Table 'briefings' ready)"))
             .catch(err => console.error(">>> DB Schema Error:", err.message));
             
-        console.log(">>> Database connection initialized using provided URL.");
+        console.log(">>> Database connection initialized.");
     } catch (e) {
         console.error(">>> DB Connection Failed:", e.message);
         pool = null; 
     }
 } else {
-    console.warn(">>> NOTICE: No DATABASE_URL or POSTGRES_URL found. Using in-memory storage.");
+    console.warn(">>> NOTICE: No DATABASE_URL found. Using Memory Mode.");
 }
 
 // --- RSS Configuration ---
 const parser = new Parser({
-    timeout: 10000,
+    timeout: 12000,
     headers: { 'User-Agent': 'Mozilla/5.0 (Compatible; AI-News-Bot)' }
 });
 
@@ -226,7 +245,7 @@ async function runJob(isMorning) {
         );
         logJob("Saved to DB successfully.");
     } else {
-        logJob("DB skipped (Not Configured). Data will be lost on restart.");
+        logJob("DB skipped (Not Configured).");
     }
     
     finishJob(true);
@@ -243,16 +262,17 @@ cron.schedule('0 6 * * *', () => runJob(false));
 
 // --- API ---
 
+// 1. Health Check (Crucial for Railway)
+app.get('/health', (req, res) => res.status(200).send('OK'));
+
 app.get('/', (req, res) => res.send('AI News Backend Active.'));
 
 app.get('/api/debug', (req, res) => {
-    // Expose which variables are actually visible to the process
     res.json({
         uptime: process.uptime(),
         env: {
             hasApiKey: !!process.env.API_KEY,
-            hasDb: !!CONNECTION_STRING,
-            dbVarName: process.env.DATABASE_URL ? 'DATABASE_URL' : (process.env.POSTGRES_URL ? 'POSTGRES_URL' : 'NONE')
+            hasDb: !!CONNECTION_STRING
         },
         jobHistory: jobHistory
     });
@@ -271,6 +291,7 @@ app.get('/api/latest', async (req, res) => {
             console.error("DB Read Error:", dbErr.message);
         }
     }
+    // Return the status card (Connected or Not) if no DB data
     return res.json(inMemoryCache);
   } catch (e) {
     res.status(500).send("Internal Server Error: " + e.message);
@@ -287,4 +308,5 @@ app.post('/api/trigger', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+// FIX: Bind to 0.0.0.0 to ensure Railway can map the port
+app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
