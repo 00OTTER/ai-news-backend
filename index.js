@@ -13,23 +13,35 @@ app.use(cors());
 app.use(express.json());
 
 // --- Database Setup ---
-// Ensure we don't crash if env is missing, but pool will fail on query
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
-});
+let pool = null;
+let inMemoryCache = []; // Fallback storage if DB is missing
 
-const TABLE_SCHEMA = `
-  CREATE TABLE IF NOT EXISTS briefings (
-    date_key TEXT PRIMARY KEY, 
-    display_date DATE,
-    content JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  );
-`;
+if (process.env.DATABASE_URL) {
+    try {
+        pool = new Pool({
+            connectionString: process.env.DATABASE_URL,
+            ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+        });
 
-// Initialize Table (Fire and forget, but handled lazily in routes if it fails)
-pool.query(TABLE_SCHEMA).catch(err => console.error("DB Init Warning:", err.message));
+        const TABLE_SCHEMA = `
+          CREATE TABLE IF NOT EXISTS briefings (
+            date_key TEXT PRIMARY KEY, 
+            display_date DATE,
+            content JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+        `;
+
+        // Initialize Table (Lazy)
+        pool.query(TABLE_SCHEMA).catch(err => console.error("DB Init Warning:", err.message));
+        console.log(">>> Database connection initialized.");
+    } catch (e) {
+        console.error(">>> DB Connection Failed:", e.message);
+        pool = null; // Ensure pool is null if init fails
+    }
+} else {
+    console.warn(">>> NOTICE: DATABASE_URL is not set. Using in-memory storage (data will be lost on restart).");
+}
 
 // --- Configuration ---
 const parser = new Parser();
@@ -92,6 +104,12 @@ async function fetchFeeds() {
 
 async function generateBriefing(feedContext) {
   console.log("Calling Gemini...");
+  
+  // Use env var primarily, but strict mode requires process.env.API_KEY
+  if (!process.env.API_KEY) {
+      throw new Error("Server missing API_KEY env var");
+  }
+
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
   const response = await ai.models.generateContent({
@@ -108,7 +126,7 @@ async function generateBriefing(feedContext) {
 
 async function runJob(isMorning) {
   const timeLabel = isMorning ? "Morning (8AM)" : "Afternoon (2PM)";
-  console.log(`>>> Running ${timeLabel} Cycle...`);
+  console.log(`>>> [JOB START] Running ${timeLabel} Cycle...`);
   
   try {
     const now = new Date();
@@ -123,28 +141,34 @@ async function runJob(isMorning) {
     const rawText = await generateBriefing(feedData);
     const jsonStr = cleanJson(rawText);
 
-    // Validate JSON before insert to prevent DB errors
+    // Validate JSON
+    let parsedContent;
     try {
-        const parsed = JSON.parse(jsonStr);
-        if(!Array.isArray(parsed)) throw new Error("Result is not an array");
+        parsedContent = JSON.parse(jsonStr);
+        if(!Array.isArray(parsedContent)) throw new Error("Result is not an array");
     } catch(e) {
         throw new Error(`Generated invalid JSON: ${e.message}`);
     }
     
-    // 3. Save
-    if (process.env.DATABASE_URL) {
+    // 3. Save (Dual Write: Memory + DB)
+    inMemoryCache = parsedContent;
+    console.log(`>>> Memory cache updated (${parsedContent.length} items).`);
+
+    if (pool) {
         await pool.query(
           `INSERT INTO briefings (date_key, display_date, content) VALUES ($1, $2, $3) 
            ON CONFLICT (date_key) DO UPDATE SET content = $3, created_at = CURRENT_TIMESTAMP`,
           [sessionKey, dateStr, jsonStr]
         );
-        console.log(`>>> Success! Briefing saved for ${sessionKey}`);
+        console.log(`>>> Success! Briefing saved to DB for ${sessionKey}`);
     } else {
-        console.warn(">>> Job finished but DATABASE_URL not set. Result not saved.");
+        console.log(">>> DB not configured, skipping persistent save.");
     }
+    
+    console.log(`>>> [JOB COMPLETE] ${timeLabel} finished successfully.`);
 
   } catch (e) {
-    console.error(`>>> ${timeLabel} Job Failed:`, e);
+    console.error(`>>> [JOB FAILED] ${timeLabel} Error:`, e);
   }
 }
 
@@ -159,50 +183,61 @@ app.get('/health', (req, res) => res.status(200).send('OK'));
 
 app.get('/api/latest', async (req, res) => {
   try {
-    if (!process.env.DATABASE_URL) {
-        return res.status(500).send("Server Error: DATABASE_URL not configured.");
-    }
-
-    const result = await pool.query('SELECT * FROM briefings ORDER BY created_at DESC LIMIT 1');
-    if (result.rows.length === 0) return res.json([]); 
-    
-    // Ensure content is parsed if it came out as string (driver behavior varies)
-    const content = typeof result.rows[0].content === 'string' 
-        ? JSON.parse(result.rows[0].content) 
-        : result.rows[0].content;
-
-    res.json(content);
-
-  } catch (e) {
-    console.error("API Error:", e.message);
-    
-    // Self-Healing: If table is missing (race condition on startup), try to create it and retry once
-    if (e.message.includes('relation "briefings" does not exist')) {
-        console.log("Attempting lazy DB initialization...");
+    // Priority 1: Try DB
+    if (pool) {
         try {
-            await pool.query(TABLE_SCHEMA);
-            const retry = await pool.query('SELECT * FROM briefings ORDER BY created_at DESC LIMIT 1');
-            if (retry.rows.length === 0) return res.json([]);
-            return res.json(typeof retry.rows[0].content === 'string' ? JSON.parse(retry.rows[0].content) : retry.rows[0].content);
-        } catch (retryErr) {
-            return res.status(500).send("DB Init Failed: " + retryErr.message);
+            const result = await pool.query('SELECT * FROM briefings ORDER BY created_at DESC LIMIT 1');
+            if (result.rows.length > 0) {
+                 // Ensure valid JSON
+                 const content = typeof result.rows[0].content === 'string' 
+                    ? JSON.parse(result.rows[0].content) 
+                    : result.rows[0].content;
+                 return res.json(content);
+            }
+        } catch (dbErr) {
+            console.error("DB Read Error (falling back):", dbErr.message);
+            // Don't error out, fall through to memory cache
         }
     }
 
-    res.status(500).send("DB Error: " + e.message);
+    // Priority 2: Memory Cache
+    if (inMemoryCache && inMemoryCache.length > 0) {
+        return res.json(inMemoryCache);
+    }
+
+    // Priority 3: Empty (Valid 200 response, not 500)
+    return res.json([]); 
+
+  } catch (e) {
+    console.error("API Fatal Error:", e);
+    res.status(500).send("Internal Server Error: " + e.message);
   }
 });
 
 app.post('/api/trigger', async (req, res) => {
-    if (req.headers['authorization'] !== process.env.API_KEY) {
-        return res.status(401).send("Unauthorized");
+    console.log(">>> [TRIGGER] Received manual trigger request.");
+    
+    // Check if Server Key is configured
+    if (!process.env.API_KEY) {
+        console.error(">>> [TRIGGER ERROR] process.env.API_KEY is missing on server.");
+        return res.status(500).send("Server Configuration Error: API_KEY missing.");
     }
+
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== process.env.API_KEY) {
+        console.warn(">>> [TRIGGER DENIED] Unauthorized access attempt.");
+        return res.status(401).send("Unauthorized: Key mismatch.");
+    }
+
     const currentHour = new Date().getUTCHours();
     const isMorning = currentHour < 3;
     
+    console.log(`>>> [TRIGGER STARTING] Mode: ${isMorning ? 'AM' : 'PM'}`);
+    
     // Run async, don't await
     runJob(isMorning);
-    res.send(`Job started in background (Mode: ${isMorning ? 'AM' : 'PM'}). Check logs for completion.`);
+    
+    res.send(`Job started in background (Mode: ${isMorning ? 'AM' : 'PM'}). Check server logs.`);
 });
 
 const PORT = process.env.PORT || 3000;
