@@ -11,6 +11,10 @@ const { Pool } = pkg;
 
 const app = express();
 
+// --- CONFIG ---
+// Use env var or fallback to the provided hardcoded key
+const API_KEY = process.env.API_KEY || 'AIzaSyDuDXq75jlwAq2m9PpJrnPEjC55vNXEimk';
+
 // --- CORS Configuration (Critical for POST requests) ---
 const corsOptions = {
     origin: '*', 
@@ -149,11 +153,18 @@ IMPORTANT RULES:
 1. FILTER STRICTLY: Do NOT include any news older than 24 hours. Check the "Date:" field.
 2. DATE ACCURACY: The "date" field in JSON MUST match the source "Date:" exactly.
 3. COMPREHENSIVE: Do not just pick the top 5. List all relevant news.
-4. **CONTENT DEPTH**: Summaries MUST be LONG, DETAILED, and INSIGHTFUL (approx 200 words / 300 Chinese characters). 
-   - Explain the technical details.
-   - Explain the business impact.
-   - Provide context on why this matters.
-5. FORMATTING: Ensure "impactScore" is a simple integer (1-10).
+4. **CONTENT DEPTH**: Summaries should be informative but concise (approx 150-200 words / 200-300 Chinese characters). 
+   - Focus on the technical novelty or business impact.
+   - Do not be overly verbose.
+5. **STRICT CATEGORIZATION**: The "category" field MUST be one of the following exact strings:
+   - "LLMs"
+   - "Image & Video"
+   - "Hardware"
+   - "Business"
+   - "Research"
+   - "Robotics"
+   If a story doesn't fit perfectly, choose the closest match. Do NOT invent new categories.
+6. FORMATTING: Ensure "impactScore" is a simple integer (1-10).
 `;
 
 const RESPONSE_SCHEMA = {
@@ -177,7 +188,10 @@ const RESPONSE_SCHEMA = {
         },
         required: ["en", "zh"]
       },
-      category: { type: Type.STRING },
+      category: { 
+        type: Type.STRING,
+        enum: ["LLMs", "Image & Video", "Hardware", "Business", "Research", "Robotics"]
+      },
       url: { type: Type.STRING },
       source: { type: Type.STRING },
       impactScore: { type: Type.NUMBER },
@@ -276,7 +290,7 @@ async function fetchFeeds() {
 
 async function generateBriefing(feedContext) {
   logJob("Calling Gemini API...");
-  if (!process.env.API_KEY) throw new Error("API_KEY missing");
+  if (!API_KEY) throw new Error("API_KEY missing");
 
   // Prevent payload too large errors
   const MAX_CHARS = 60000;
@@ -284,7 +298,7 @@ async function generateBriefing(feedContext) {
     ? feedContext.substring(0, MAX_CHARS) + "\n...[TRUNCATED]" 
     : feedContext;
 
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const ai = new GoogleGenAI({ apiKey: API_KEY });
   const response = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
     contents: safeContext + "\n\nGenerate the comprehensive daily feed based on the above. STRICTLY last 24 hours.",
@@ -402,7 +416,7 @@ app.get('/health', (req, res) => res.status(200).send('OK'));
 app.get('/', (req, res) => res.send('AI News Backend Active.'));
 
 app.get('/api/debug', (req, res) => {
-    res.json({ uptime: process.uptime(), env: { hasApiKey: !!process.env.API_KEY, hasDb: !!CONNECTION_STRING }, jobHistory });
+    res.json({ uptime: process.uptime(), env: { hasApiKey: !!API_KEY, hasDb: !!CONNECTION_STRING }, jobHistory });
 });
 
 // GET LATEST (Default)
@@ -473,9 +487,9 @@ app.get('/api/archive/:date', async (req, res) => {
 });
 
 app.post('/api/trigger', async (req, res) => {
-    if (!process.env.API_KEY) return res.status(500).send("API_KEY missing");
+    if (!API_KEY) return res.status(500).send("API_KEY missing");
     const authHeader = req.headers['authorization'] || '';
-    if (authHeader.trim() !== process.env.API_KEY.trim()) return res.status(401).send("Unauthorized");
+    if (authHeader.trim() !== API_KEY.trim()) return res.status(401).send("Unauthorized");
 
     const isMorning = new Date().getUTCHours() < 3;
     runJob(isMorning);
