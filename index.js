@@ -200,16 +200,19 @@ async function fetchFeeds() {
           
           // INCREASED LIMIT: Process up to 15 items per source to get "All News"
           feed.items.forEach(item => {
-             const itemDateStr = item.pubDate || item.isoDate;
+             const itemDateStr = item.pubDate || item.isoDate || item.date;
              let itemDate = itemDateStr ? new Date(itemDateStr) : null;
              
-             if (itemDate && !isNaN(itemDate.getTime())) {
-                 if (itemDate < cutoffTime) return; // Skip old news
-             } else {
-                 itemDate = new Date(); // Fallback
+             // STRICTER DATE CHECK:
+             // If date is invalid or missing, we skip it.
+             // We do NOT default to 'new Date()' anymore, as that incorrectly labels old news as "Today".
+             if (!itemDate || isNaN(itemDate.getTime())) {
+                 return; 
              }
+             
+             if (itemDate < cutoffTime) return; // Skip old news
 
-             if (addedCount >= 15) return; // Increased from 8 to 15
+             if (addedCount >= 15) return; 
 
              const snippet = item.contentSnippet || item.content || "";
              context += `Title: ${item.title}\nDate: ${itemDate.toISOString()}\nLink: ${item.link}\nSnippet: ${snippet.substring(0, 300)}...\n\n`;
@@ -262,6 +265,8 @@ async function runJob(isMorning) {
     // 3.5. Sanitize Data
     parsedContent = parsedContent.map((item, idx) => {
         let validDate = item.date;
+        // Keep the generation timestamp fallback ONLY if the AI returns strictly nothing.
+        // But since we filtered inputs, the AI *should* have valid dates.
         if (!validDate || isNaN(new Date(validDate).getTime())) {
             validDate = new Date().toISOString();
         }
