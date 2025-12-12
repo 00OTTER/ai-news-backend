@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 import express from 'express';
 import pkg from 'pg';
@@ -12,20 +13,17 @@ const app = express();
 
 // --- CORS Configuration (Critical for POST requests) ---
 const corsOptions = {
-    origin: '*', // In production, replace with your frontend domain if possible
+    origin: '*', 
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
     optionsSuccessStatus: 200
 };
 
-// Handle preflight requests for all routes
 app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
-
 app.use(express.json());
 
-// --- Graceful Shutdown ---
 process.on('SIGTERM', () => {
     console.log('>>> SIGTERM received. Server shutting down.');
     process.exit(0);
@@ -35,17 +33,8 @@ process.on('SIGTERM', () => {
 let pool = null;
 let jobHistory = []; 
 
-// 1. Determine Database URL
 const CONNECTION_STRING = process.env.DATABASE_URL || process.env.POSTGRES_URL;
 
-// 2. Startup Diagnostic
-console.log(">>> ENVIRONMENT DIAGNOSTIC:");
-console.log(">>> Keys present:", Object.keys(process.env).filter(k => !k.startsWith('npm_')).join(', '));
-console.log(">>> Has API_KEY:", !!process.env.API_KEY);
-console.log(">>> Has DB URL:", !!CONNECTION_STRING);
-console.log(">>> CORS Policy: Allowed Authorization header");
-
-// 3. Initialize Status Card based on Config
 const getInitialStatus = () => {
     if (CONNECTION_STRING) {
         return [{
@@ -117,12 +106,9 @@ if (CONNECTION_STRING) {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
           );
         `;
-        // Non-blocking schema init to avoid stalling startup
         pool.query(TABLE_SCHEMA)
-            .then(() => console.log(">>> DB Schema Verified (Table 'briefings' ready)"))
+            .then(() => console.log(">>> DB Schema Verified"))
             .catch(err => console.error(">>> DB Schema Error:", err.message));
-            
-        console.log(">>> Database connection initialized.");
     } catch (e) {
         console.error(">>> DB Connection Failed:", e.message);
         pool = null; 
@@ -131,13 +117,11 @@ if (CONNECTION_STRING) {
     console.warn(">>> NOTICE: No DATABASE_URL found. Using Memory Mode.");
 }
 
-// --- RSS Configuration ---
 const parser = new Parser({
     timeout: 12000,
     headers: { 'User-Agent': 'Mozilla/5.0 (Compatible; AI-News-Bot)' }
 });
 
-// Synced with frontend mirror list for better robustness
 const RSSHUB_MIRRORS = [
     'https://rsshub.app',
     'https://rsshub.feedlib.xyz',
@@ -156,12 +140,19 @@ const SOURCES = [
    { name: 'Reddit StableDiffusion', url: 'https://rsshub.app/reddit/subreddit/StableDiffusion' }
 ];
 
+// UPDATED: Requested more items (20-30) and stricter date handling
 const SYSTEM_INSTRUCTION = `
 You are an expert AI News Aggregator. Analyze the RAW FEED DATA.
-Select the top 8-12 most important AI stories.
-Generate a JSON array with fields: title (en/zh), summary (en/zh), category, url, source, impactScore (1-10), tags.
+Your goal is to provide COMPREHENSIVE coverage of the last 24 hours.
+Identify ALL significant AI stories (aim for 20-30 items if available).
+Generate a JSON array with fields: title (en/zh), summary (en/zh), category, url, source, impactScore (1-10), tags, date.
 Category options: LLMs, Image & Video, Hardware, Business, Research, Robotics.
-STRICTLY return valid JSON only.
+
+IMPORTANT RULES:
+1. FILTER STRICTLY: Do NOT include any news older than 24 hours. Check the "Date:" field.
+2. DATE ACCURACY: The "date" field in JSON MUST match the source "Date:" exactly.
+3. COMPREHENSIVE: Do not just pick the top 5. List all relevant news.
+4. STRUCTURE: Return valid JSON only.
 `;
 
 function cleanJson(text) {
@@ -174,7 +165,6 @@ function cleanJson(text) {
   return cleaned;
 }
 
-// --- Robust Fetcher ---
 async function fetchWithMirrors(source) {
     let urlsToTry = [source.url];
     if (source.url.includes('rsshub.app')) {
@@ -198,16 +188,34 @@ async function fetchFeeds() {
   let context = "RAW FEED DATA:\n";
   logJob("Starting feed fetch...");
   
+  const now = new Date();
+  const cutoffTime = new Date(now.getTime() - 24 * 60 * 60 * 1000); // 24 Hours Ago
+
   for (const source of SOURCES) {
     try {
       const feed = await fetchWithMirrors(source);
       if (feed && feed.items) {
           context += `--- SOURCE: ${source.name} ---\n`;
-          feed.items.slice(0, 5).forEach(item => {
+          let addedCount = 0;
+          
+          // INCREASED LIMIT: Process up to 15 items per source to get "All News"
+          feed.items.forEach(item => {
+             const itemDateStr = item.pubDate || item.isoDate;
+             let itemDate = itemDateStr ? new Date(itemDateStr) : null;
+             
+             if (itemDate && !isNaN(itemDate.getTime())) {
+                 if (itemDate < cutoffTime) return; // Skip old news
+             } else {
+                 itemDate = new Date(); // Fallback
+             }
+
+             if (addedCount >= 15) return; // Increased from 8 to 15
+
              const snippet = item.contentSnippet || item.content || "";
-             context += `Title: ${item.title}\nLink: ${item.link}\nSnippet: ${snippet.substring(0, 200)}...\n\n`;
+             context += `Title: ${item.title}\nDate: ${itemDate.toISOString()}\nLink: ${item.link}\nSnippet: ${snippet.substring(0, 300)}...\n\n`;
+             addedCount++;
           });
-          logJob(`Fetched ${source.name} (${feed.items.length})`);
+          logJob(`Fetched ${source.name} (${addedCount} fresh items)`);
       }
     } catch (e) {
       logJob(`Skipped ${source.name}: ${e.message}`);
@@ -223,10 +231,9 @@ async function generateBriefing(feedContext) {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   const response = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
-    contents: feedContext + "\n\nGenerate the daily briefing based on the above.",
+    contents: feedContext + "\n\nGenerate the comprehensive daily feed based on the above. STRICTLY last 24 hours.",
     config: { responseMimeType: 'application/json', systemInstruction: SYSTEM_INSTRUCTION }
   });
-  // FIX: Access text as property, not function
   return response.text;
 }
 
@@ -237,13 +244,13 @@ async function runJob(isMorning) {
   
   try {
     const now = new Date();
+    // Use full date string as key to separate AM/PM if needed, or just date for daily
     const dateStr = now.toISOString().split('T')[0];
     const sessionKey = `${dateStr}-${isMorning ? 'AM' : 'PM'}`;
     
     // 1. Fetch
     const feedData = await fetchFeeds();
-    if (feedData.length < 50) logJob("WARNING: Feed data extremely short.");
-
+    
     // 2. Generate
     const rawText = await generateBriefing(feedData);
     logJob("Gemini response received.");
@@ -252,7 +259,21 @@ async function runJob(isMorning) {
     let parsedContent = JSON.parse(cleanJson(rawText));
     if(!Array.isArray(parsedContent)) throw new Error("Invalid JSON Array");
     
-    // 4. Save
+    // 3.5. Sanitize Data
+    parsedContent = parsedContent.map((item, idx) => {
+        let validDate = item.date;
+        if (!validDate || isNaN(new Date(validDate).getTime())) {
+            validDate = new Date().toISOString();
+        }
+        return {
+            ...item,
+            id: item.id || `gen-${Date.now()}-${idx}`,
+            date: validDate,
+            title: (typeof item.title === 'string') ? { en: item.title, zh: item.title } : item.title,
+            summary: (typeof item.summary === 'string') ? { en: item.summary, zh: item.summary } : item.summary,
+        };
+    });
+
     inMemoryCache = parsedContent;
     logJob(`Memory cache updated (${parsedContent.length} items).`);
 
@@ -263,10 +284,7 @@ async function runJob(isMorning) {
           [sessionKey, dateStr, JSON.stringify(parsedContent)]
         );
         logJob("Saved to DB successfully.");
-    } else {
-        logJob("DB skipped (Not Configured).");
     }
-    
     finishJob(true);
 
   } catch (e) {
@@ -280,59 +298,89 @@ cron.schedule('0 0 * * *', () => runJob(true));
 cron.schedule('0 6 * * *', () => runJob(false)); 
 
 // --- API ---
-
-// 1. Health Check (Crucial for Railway)
 app.get('/health', (req, res) => res.status(200).send('OK'));
-
 app.get('/', (req, res) => res.send('AI News Backend Active.'));
 
 app.get('/api/debug', (req, res) => {
-    res.json({
-        uptime: process.uptime(),
-        env: {
-            hasApiKey: !!process.env.API_KEY,
-            hasDb: !!CONNECTION_STRING
-        },
-        jobHistory: jobHistory
-    });
+    res.json({ uptime: process.uptime(), env: { hasApiKey: !!process.env.API_KEY, hasDb: !!CONNECTION_STRING }, jobHistory });
 });
 
+// GET LATEST (Default)
 app.get('/api/latest', async (req, res) => {
   try {
     if (pool) {
-        try {
-            const result = await pool.query('SELECT * FROM briefings ORDER BY created_at DESC LIMIT 1');
-            if (result.rows.length > 0) {
-                 const content = result.rows[0].content;
-                 return res.json(typeof content === 'string' ? JSON.parse(content) : content);
-            }
-        } catch (dbErr) {
-            console.error("DB Read Error:", dbErr.message);
+        // Fetch the most recent successful generation
+        const result = await pool.query('SELECT * FROM briefings ORDER BY created_at DESC LIMIT 1');
+        if (result.rows.length > 0) {
+             const content = result.rows[0].content;
+             return res.json(typeof content === 'string' ? JSON.parse(content) : content);
         }
     }
-    // Return the status card (Connected or Not) if no DB data
     return res.json(inMemoryCache);
   } catch (e) {
-    res.status(500).send("Internal Server Error: " + e.message);
+    res.status(500).send(e.message);
   }
 });
 
-app.post('/api/trigger', async (req, res) => {
-    console.log(">>> TRIGGER REQUEST RECEIVED");
-    
-    if (!process.env.API_KEY) return res.status(500).send("API_KEY missing");
-    
-    const authHeader = req.headers['authorization'] || '';
-    if (authHeader.trim() !== process.env.API_KEY.trim()) {
-        console.log(">>> AUTH FAILED. Check API Key whitespace.");
-        return res.status(401).send("Unauthorized");
+// NEW: GET AVAILABLE DATES
+app.get('/api/dates', async (req, res) => {
+    try {
+        if (!pool) return res.json([]);
+        // Return distinct dates present in DB, sorted new to old
+        const result = await pool.query('SELECT DISTINCT display_date FROM briefings ORDER BY display_date DESC LIMIT 30');
+        const dates = result.rows.map(r => {
+             // Handle PG date object or string
+             const d = new Date(r.display_date);
+             return d.toISOString().split('T')[0];
+        });
+        res.json(dates);
+    } catch (e) {
+        console.error(e);
+        res.status(500).send(e.message);
     }
+});
+
+// NEW: GET ARCHIVE BY DATE
+app.get('/api/archive/:date', async (req, res) => {
+    try {
+        const { date } = req.params;
+        if (!pool) return res.json([]);
+        
+        // Fetch specific date. If multiple (AM/PM), merge them or take latest?
+        // Let's take ALL items from that day and merge them for a "Full Day" view
+        const result = await pool.query('SELECT content FROM briefings WHERE display_date = $1 ORDER BY created_at DESC', [date]);
+        
+        let mergedContent = [];
+        result.rows.forEach(row => {
+            const batch = typeof row.content === 'string' ? JSON.parse(row.content) : row.content;
+            if (Array.isArray(batch)) mergedContent = [...mergedContent, ...batch];
+        });
+        
+        // Deduplicate based on URL or Title
+        const seen = new Set();
+        const uniqueContent = mergedContent.filter(item => {
+            const key = item.url || item.title.en;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+
+        res.json(uniqueContent);
+    } catch (e) {
+        console.error(e);
+        res.status(500).send(e.message);
+    }
+});
+
+app.post('/api/trigger', async (req, res) => {
+    if (!process.env.API_KEY) return res.status(500).send("API_KEY missing");
+    const authHeader = req.headers['authorization'] || '';
+    if (authHeader.trim() !== process.env.API_KEY.trim()) return res.status(401).send("Unauthorized");
 
     const isMorning = new Date().getUTCHours() < 3;
     runJob(isMorning);
-    res.send("Job started. Agent is scraping feeds... check back in 1 minute.");
+    res.send("Job started.");
 });
 
 const PORT = process.env.PORT || 3000;
-// FIX: Bind to 0.0.0.0 to ensure Railway can map the port
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
