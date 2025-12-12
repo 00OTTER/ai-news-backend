@@ -12,39 +12,40 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- Graceful Shutdown (Fixes npm error SIGTERM) ---
+// --- Graceful Shutdown ---
 process.on('SIGTERM', () => {
-    console.log('>>> SIGTERM received. Closing server gracefully...');
-    process.exit(0); // Success code prevents "npm error" logs
+    console.log('>>> SIGTERM received. Server shutting down.');
+    process.exit(0);
 });
 
-// --- Global Error Handlers ---
-process.on('uncaughtException', (err) => {
-  console.error('UNCAUGHT EXCEPTION:', err);
-});
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('UNHANDLED REJECTION:', reason);
-});
-
-// --- In-Memory State ---
+// --- State & Logs ---
 let pool = null;
 let jobHistory = []; 
 
-// Default state so frontend shows *something* instead of empty list
+// 1. Determine Database URL (Support both standard names)
+const CONNECTION_STRING = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+
+// 2. Startup Diagnostic (Helps user see if vars are actually injected)
+console.log(">>> ENVIRONMENT DIAGNOSTIC:");
+console.log(">>> Keys present:", Object.keys(process.env).filter(k => !k.startsWith('npm_')).join(', '));
+console.log(">>> Has API_KEY:", !!process.env.API_KEY);
+console.log(">>> Has DB URL:", !!CONNECTION_STRING);
+
+// DEFAULT STATE
 let inMemoryCache = [
     {
-        id: 'sys-init',
-        title: { en: "Backend Online - Waiting for Trigger", zh: "后端服务在线 - 等待任务触发" },
+        id: 'sys-status',
+        title: { en: "⚠️ SYSTEM STATUS: Database Not Connected", zh: "⚠️ 系统状态：未连接数据库" },
         summary: { 
-            en: "The backend is connected. If this is the only card, the AI Job hasn't run successfully yet. Please check API_KEY is set in Railway Variables and click 'Trigger Cloud Update'.", 
-            zh: "后端连接成功。如果你只看到这张卡片，说明 AI 任务尚未成功运行。请检查 Railway 环境变量中是否设置了 API_KEY，然后点击“触发云端更新”。" 
+            en: "The backend is running in 'Memory Mode'. If you have added DATABASE_URL to Railway, you MUST Redeploy the service for it to take effect. Check the Railway Build/Deploy logs to see the 'ENVIRONMENT DIAGNOSTIC' output.", 
+            zh: "后端运行在“内存模式”。如果您已经在 Railway 添加了 DATABASE_URL，请务必“重新部署 (Redeploy)”服务以使其生效。请检查 Railway 的部署日志查看“ENVIRONMENT DIAGNOSTIC”输出。" 
         },
         category: "System",
         url: "#",
         source: "System",
         date: new Date().toISOString(),
-        impactScore: 1,
-        tags: ["Status", "Waiting"]
+        impactScore: 10,
+        tags: ["Config Required", "Action Needed"]
     }
 ];
 
@@ -68,12 +69,12 @@ function finishJob(success = true, error = null) {
     }
 }
 
-// --- Database Setup ---
-if (process.env.DATABASE_URL) {
+// --- Database Connection ---
+if (CONNECTION_STRING) {
     try {
         pool = new Pool({
-            connectionString: process.env.DATABASE_URL,
-            ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+            connectionString: CONNECTION_STRING,
+            ssl: CONNECTION_STRING.includes('localhost') ? false : { rejectUnauthorized: false }
         });
         const TABLE_SCHEMA = `
           CREATE TABLE IF NOT EXISTS briefings (
@@ -83,24 +84,31 @@ if (process.env.DATABASE_URL) {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
           );
         `;
-        pool.query(TABLE_SCHEMA).catch(err => console.error("DB Init Warning:", err.message));
-        console.log(">>> Database connection initialized.");
+        pool.query(TABLE_SCHEMA)
+            .then(() => console.log(">>> DB Schema Verified (Table 'briefings' ready)"))
+            .catch(err => console.error(">>> DB Schema Error:", err.message));
+            
+        console.log(">>> Database connection initialized using provided URL.");
     } catch (e) {
         console.error(">>> DB Connection Failed:", e.message);
         pool = null; 
     }
 } else {
-    console.warn(">>> NOTICE: DATABASE_URL is not set. Using in-memory storage.");
+    console.warn(">>> NOTICE: No DATABASE_URL or POSTGRES_URL found. Using in-memory storage.");
 }
 
-// --- Configuration ---
+// --- RSS Configuration ---
 const parser = new Parser({
-    timeout: 15000, 
-    headers: { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8'
-    }
+    timeout: 10000,
+    headers: { 'User-Agent': 'Mozilla/5.0 (Compatible; AI-News-Bot)' }
 });
+
+const RSSHUB_MIRRORS = [
+    'https://rsshub.app',
+    'https://rsshub.feedlib.xyz',
+    'https://rsshub.pseudoyu.com',
+    'https://rsshub.blue'
+];
 
 const SOURCES = [
    { name: 'Tencent Tech', url: 'https://rsshub.app/tencent/news/channel/tech' },
@@ -129,7 +137,25 @@ function cleanJson(text) {
   return cleaned;
 }
 
-// --- Core Logic ---
+// --- Robust Fetcher ---
+async function fetchWithMirrors(source) {
+    let urlsToTry = [source.url];
+    if (source.url.includes('rsshub.app')) {
+        const path = source.url.split('rsshub.app')[1];
+        urlsToTry = RSSHUB_MIRRORS.map(domain => `${domain}${path}`);
+    }
+
+    for (const url of urlsToTry.slice(0, 3)) {
+        try {
+            const feed = await Promise.race([
+                parser.parseURL(url),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 8000))
+            ]);
+            if (feed && feed.items) return feed;
+        } catch (e) { }
+    }
+    throw new Error(`All mirrors failed for ${source.name}`);
+}
 
 async function fetchFeeds() {
   let context = "RAW FEED DATA:\n";
@@ -137,19 +163,14 @@ async function fetchFeeds() {
   
   for (const source of SOURCES) {
     try {
-      // Use standard fetch with timeout for parser
-      const feed = await Promise.race([
-          parser.parseURL(source.url),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))
-      ]);
-      
+      const feed = await fetchWithMirrors(source);
       if (feed && feed.items) {
           context += `--- SOURCE: ${source.name} ---\n`;
           feed.items.slice(0, 5).forEach(item => {
              const snippet = item.contentSnippet || item.content || "";
              context += `Title: ${item.title}\nLink: ${item.link}\nSnippet: ${snippet.substring(0, 200)}...\n\n`;
           });
-          logJob(`Fetched ${source.name} (${feed.items.length} items)`);
+          logJob(`Fetched ${source.name} (${feed.items.length})`);
       }
     } catch (e) {
       logJob(`Skipped ${source.name}: ${e.message}`);
@@ -160,22 +181,14 @@ async function fetchFeeds() {
 
 async function generateBriefing(feedContext) {
   logJob("Calling Gemini API...");
-  
-  if (!process.env.API_KEY) {
-      throw new Error("Server missing API_KEY env var in Railway Settings.");
-  }
+  if (!process.env.API_KEY) throw new Error("API_KEY missing");
 
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  
   const response = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
     contents: feedContext + "\n\nGenerate the daily briefing based on the above.",
-    config: { 
-        responseMimeType: 'application/json',
-        systemInstruction: SYSTEM_INSTRUCTION
-    }
+    config: { responseMimeType: 'application/json', systemInstruction: SYSTEM_INSTRUCTION }
   });
-  
   return response.text();
 }
 
@@ -191,39 +204,29 @@ async function runJob(isMorning) {
     
     // 1. Fetch
     const feedData = await fetchFeeds();
-    if (feedData.length < 50) {
-        logJob("WARNING: Feed data is empty. Check internet/proxy.");
-    }
+    if (feedData.length < 50) logJob("WARNING: Feed data extremely short.");
 
     // 2. Generate
     const rawText = await generateBriefing(feedData);
     logJob("Gemini response received.");
     
-    const jsonStr = cleanJson(rawText);
-
-    // Validate JSON
-    let parsedContent;
-    try {
-        parsedContent = JSON.parse(jsonStr);
-        if(!Array.isArray(parsedContent)) throw new Error("Result is not an array");
-    } catch(e) {
-        logJob(`JSON Parse Error: ${e.message}`);
-        throw e;
-    }
+    // 3. Parse
+    let parsedContent = JSON.parse(cleanJson(rawText));
+    if(!Array.isArray(parsedContent)) throw new Error("Invalid JSON Array");
     
-    // 3. Save
+    // 4. Save
     inMemoryCache = parsedContent;
-    logJob(`Memory updated (${parsedContent.length} items).`);
+    logJob(`Memory cache updated (${parsedContent.length} items).`);
 
     if (pool) {
         await pool.query(
           `INSERT INTO briefings (date_key, display_date, content) VALUES ($1, $2, $3) 
            ON CONFLICT (date_key) DO UPDATE SET content = $3, created_at = CURRENT_TIMESTAMP`,
-          [sessionKey, dateStr, jsonStr]
+          [sessionKey, dateStr, JSON.stringify(parsedContent)]
         );
-        logJob("Saved to DB.");
+        logJob("Saved to DB successfully.");
     } else {
-        logJob("DB skipped (not configured).");
+        logJob("DB skipped (Not Configured). Data will be lost on restart.");
     }
     
     finishJob(true);
@@ -243,11 +246,13 @@ cron.schedule('0 6 * * *', () => runJob(false));
 app.get('/', (req, res) => res.send('AI News Backend Active.'));
 
 app.get('/api/debug', (req, res) => {
+    // Expose which variables are actually visible to the process
     res.json({
         uptime: process.uptime(),
         env: {
             hasApiKey: !!process.env.API_KEY,
-            hasDb: !!process.env.DATABASE_URL
+            hasDb: !!CONNECTION_STRING,
+            dbVarName: process.env.DATABASE_URL ? 'DATABASE_URL' : (process.env.POSTGRES_URL ? 'POSTGRES_URL' : 'NONE')
         },
         jobHistory: jobHistory
     });
@@ -255,45 +260,30 @@ app.get('/api/debug', (req, res) => {
 
 app.get('/api/latest', async (req, res) => {
   try {
-    // 1. DB
     if (pool) {
         try {
             const result = await pool.query('SELECT * FROM briefings ORDER BY created_at DESC LIMIT 1');
             if (result.rows.length > 0) {
-                 const content = typeof result.rows[0].content === 'string' 
-                    ? JSON.parse(result.rows[0].content) 
-                    : result.rows[0].content;
-                 return res.json(content);
+                 const content = result.rows[0].content;
+                 return res.json(typeof content === 'string' ? JSON.parse(content) : content);
             }
         } catch (dbErr) {
             console.error("DB Read Error:", dbErr.message);
         }
     }
-
-    // 2. Cache (Always returns at least the default system status if empty)
     return res.json(inMemoryCache);
-
   } catch (e) {
     res.status(500).send("Internal Server Error: " + e.message);
   }
 });
 
 app.post('/api/trigger', async (req, res) => {
-    console.log(">>> [TRIGGER] Request received.");
-    
-    if (!process.env.API_KEY) {
-        return res.status(500).send("Server Config Error: API_KEY missing in Railway Variables.");
-    }
-
-    // Simple auth check
-    if (req.headers['authorization'] !== process.env.API_KEY) {
-        return res.status(401).send("Unauthorized: Key Mismatch");
-    }
+    if (!process.env.API_KEY) return res.status(500).send("API_KEY missing");
+    if (req.headers['authorization'] !== process.env.API_KEY) return res.status(401).send("Unauthorized");
 
     const isMorning = new Date().getUTCHours() < 3;
-    runJob(isMorning); 
-    
-    res.send("Job started in background. Check /api/debug.");
+    runJob(isMorning);
+    res.send("Job started. Check /api/debug for progress.");
 });
 
 const PORT = process.env.PORT || 3000;
