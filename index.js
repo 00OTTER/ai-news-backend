@@ -151,6 +151,7 @@ IMPORTANT RULES:
 1. FILTER STRICTLY: Do NOT include any news older than 24 hours. Check the "Date:" field.
 2. DATE ACCURACY: The "date" field in JSON MUST match the source "Date:" exactly.
 3. COMPREHENSIVE: Do not just pick the top 5. List all relevant news.
+4. FORMATTING: Ensure "impactScore" is a simple integer (1-10).
 `;
 
 const RESPONSE_SCHEMA = {
@@ -188,10 +189,26 @@ const RESPONSE_SCHEMA = {
 function cleanJson(text) {
   if (!text) return "[]";
   let cleaned = text.trim();
+  
+  // 1. Try Markdown Regex to strip ```json ... ``` wrappers
   const codeBlockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   if (codeBlockMatch) {
-    cleaned = codeBlockMatch[1];
+    cleaned = codeBlockMatch[1].trim();
   }
+  
+  // 2. Fallback: Robustly find the first '[' and last ']' to ignore preamble/postamble
+  // This fixes "Unexpected number" errors caused by text like "Here is the data: [...]"
+  const firstOpen = cleaned.indexOf('[');
+  const lastClose = cleaned.lastIndexOf(']');
+  
+  if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
+      cleaned = cleaned.substring(firstOpen, lastClose + 1);
+  } else {
+      // If no brackets found, it might be invalid, but let's return it and let JSON.parse fail with a clearer error
+      // or return empty array if it looks like just text.
+      if (!cleaned.startsWith('[')) return "[]";
+  }
+  
   return cleaned;
 }
 
@@ -288,13 +305,14 @@ async function runJob(isMorning) {
     logJob("Gemini response received.");
     
     // 3. Parse
-    // With responseSchema, output is almost guaranteed to be valid JSON.
-    // cleanJson is still used in case of rare markdown wrapping.
     let parsedContent;
+    const cleanedText = cleanJson(rawText);
+    
     try {
-        parsedContent = JSON.parse(cleanJson(rawText));
+        parsedContent = JSON.parse(cleanedText);
     } catch (parseErr) {
         logJob(`JSON Parse Error: ${parseErr.message}`);
+        logJob(`Faulty Text Snippet: ${cleanedText.substring(0, 100)}...`); // Log start of text for debug
         throw new Error(`Invalid JSON: ${parseErr.message}`);
     }
 
