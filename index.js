@@ -12,17 +12,69 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- Database Setup ---
-let pool = null;
-let inMemoryCache = []; // Fallback storage if DB is missing
+// --- Graceful Shutdown (Fixes npm error SIGTERM) ---
+process.on('SIGTERM', () => {
+    console.log('>>> SIGTERM received. Closing server gracefully...');
+    process.exit(0); // Success code prevents "npm error" logs
+});
 
+// --- Global Error Handlers ---
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('UNHANDLED REJECTION:', reason);
+});
+
+// --- In-Memory State ---
+let pool = null;
+let jobHistory = []; 
+
+// Default state so frontend shows *something* instead of empty list
+let inMemoryCache = [
+    {
+        id: 'sys-init',
+        title: { en: "Backend Online - Waiting for Trigger", zh: "后端服务在线 - 等待任务触发" },
+        summary: { 
+            en: "The backend is connected. If this is the only card, the AI Job hasn't run successfully yet. Please check API_KEY is set in Railway Variables and click 'Trigger Cloud Update'.", 
+            zh: "后端连接成功。如果你只看到这张卡片，说明 AI 任务尚未成功运行。请检查 Railway 环境变量中是否设置了 API_KEY，然后点击“触发云端更新”。" 
+        },
+        category: "System",
+        url: "#",
+        source: "System",
+        date: new Date().toISOString(),
+        impactScore: 1,
+        tags: ["Status", "Waiting"]
+    }
+];
+
+function logJob(message) {
+    const entry = `[${new Date().toISOString().split('T')[1].split('.')[0]}] ${message}`;
+    console.log(entry);
+    if (jobHistory.length === 0 || jobHistory[0].finished) {
+        jobHistory.unshift({ id: Date.now(), started: new Date(), logs: [entry], finished: false });
+    } else {
+        jobHistory[0].logs.push(entry);
+    }
+    if (jobHistory.length > 5) jobHistory.pop();
+}
+
+function finishJob(success = true, error = null) {
+    if (jobHistory.length > 0 && !jobHistory[0].finished) {
+        jobHistory[0].finished = true;
+        jobHistory[0].success = success;
+        jobHistory[0].error = error ? error.toString() : null;
+        jobHistory[0].logs.push(success ? ">>> COMPLETED SUCCESS" : `>>> FAILED: ${error}`);
+    }
+}
+
+// --- Database Setup ---
 if (process.env.DATABASE_URL) {
     try {
         pool = new Pool({
             connectionString: process.env.DATABASE_URL,
             ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
         });
-
         const TABLE_SCHEMA = `
           CREATE TABLE IF NOT EXISTS briefings (
             date_key TEXT PRIMARY KEY, 
@@ -31,20 +83,24 @@ if (process.env.DATABASE_URL) {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
           );
         `;
-
-        // Initialize Table (Lazy)
         pool.query(TABLE_SCHEMA).catch(err => console.error("DB Init Warning:", err.message));
         console.log(">>> Database connection initialized.");
     } catch (e) {
         console.error(">>> DB Connection Failed:", e.message);
-        pool = null; // Ensure pool is null if init fails
+        pool = null; 
     }
 } else {
-    console.warn(">>> NOTICE: DATABASE_URL is not set. Using in-memory storage (data will be lost on restart).");
+    console.warn(">>> NOTICE: DATABASE_URL is not set. Using in-memory storage.");
 }
 
 // --- Configuration ---
-const parser = new Parser();
+const parser = new Parser({
+    timeout: 15000, 
+    headers: { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8'
+    }
+});
 
 const SOURCES = [
    { name: 'Tencent Tech', url: 'https://rsshub.app/tencent/news/channel/tech' },
@@ -63,12 +119,9 @@ Category options: LLMs, Image & Video, Hardware, Business, Research, Robotics.
 STRICTLY return valid JSON only.
 `;
 
-// --- Helpers ---
-
 function cleanJson(text) {
   if (!text) return "[]";
   let cleaned = text.trim();
-  // Remove markdown code blocks if present
   const codeBlockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   if (codeBlockMatch) {
     cleaned = codeBlockMatch[1];
@@ -80,34 +133,36 @@ function cleanJson(text) {
 
 async function fetchFeeds() {
   let context = "RAW FEED DATA:\n";
-  console.log("Starting feed fetch...");
+  logJob("Starting feed fetch...");
   
   for (const source of SOURCES) {
     try {
+      // Use standard fetch with timeout for parser
       const feed = await Promise.race([
           parser.parseURL(source.url),
           new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))
       ]);
       
-      context += `--- SOURCE: ${source.name} ---\n`;
-      feed.items.slice(0, 5).forEach(item => {
-         const snippet = item.contentSnippet || item.content || "";
-         context += `Title: ${item.title}\nLink: ${item.link}\nSnippet: ${snippet.substring(0, 200)}...\n\n`;
-      });
-      console.log(`Fetched ${source.name}`);
+      if (feed && feed.items) {
+          context += `--- SOURCE: ${source.name} ---\n`;
+          feed.items.slice(0, 5).forEach(item => {
+             const snippet = item.contentSnippet || item.content || "";
+             context += `Title: ${item.title}\nLink: ${item.link}\nSnippet: ${snippet.substring(0, 200)}...\n\n`;
+          });
+          logJob(`Fetched ${source.name} (${feed.items.length} items)`);
+      }
     } catch (e) {
-      console.error(`Failed to fetch ${source.name}:`, e.message);
+      logJob(`Skipped ${source.name}: ${e.message}`);
     }
   }
   return context;
 }
 
 async function generateBriefing(feedContext) {
-  console.log("Calling Gemini...");
+  logJob("Calling Gemini API...");
   
-  // Use env var primarily, but strict mode requires process.env.API_KEY
   if (!process.env.API_KEY) {
-      throw new Error("Server missing API_KEY env var");
+      throw new Error("Server missing API_KEY env var in Railway Settings.");
   }
 
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -125,8 +180,9 @@ async function generateBriefing(feedContext) {
 }
 
 async function runJob(isMorning) {
-  const timeLabel = isMorning ? "Morning (8AM)" : "Afternoon (2PM)";
-  console.log(`>>> [JOB START] Running ${timeLabel} Cycle...`);
+  const timeLabel = isMorning ? "Morning" : "Afternoon";
+  jobHistory.unshift({ id: Date.now(), started: new Date(), logs: [], finished: false });
+  logJob(`Job Started: ${timeLabel}`);
   
   try {
     const now = new Date();
@@ -135,10 +191,14 @@ async function runJob(isMorning) {
     
     // 1. Fetch
     const feedData = await fetchFeeds();
-    if (feedData.length < 50) throw new Error("Feeds empty or failed (Content too short)");
+    if (feedData.length < 50) {
+        logJob("WARNING: Feed data is empty. Check internet/proxy.");
+    }
 
     // 2. Generate
     const rawText = await generateBriefing(feedData);
+    logJob("Gemini response received.");
+    
     const jsonStr = cleanJson(rawText);
 
     // Validate JSON
@@ -147,12 +207,13 @@ async function runJob(isMorning) {
         parsedContent = JSON.parse(jsonStr);
         if(!Array.isArray(parsedContent)) throw new Error("Result is not an array");
     } catch(e) {
-        throw new Error(`Generated invalid JSON: ${e.message}`);
+        logJob(`JSON Parse Error: ${e.message}`);
+        throw e;
     }
     
-    // 3. Save (Dual Write: Memory + DB)
+    // 3. Save
     inMemoryCache = parsedContent;
-    console.log(`>>> Memory cache updated (${parsedContent.length} items).`);
+    logJob(`Memory updated (${parsedContent.length} items).`);
 
     if (pool) {
         await pool.query(
@@ -160,84 +221,79 @@ async function runJob(isMorning) {
            ON CONFLICT (date_key) DO UPDATE SET content = $3, created_at = CURRENT_TIMESTAMP`,
           [sessionKey, dateStr, jsonStr]
         );
-        console.log(`>>> Success! Briefing saved to DB for ${sessionKey}`);
+        logJob("Saved to DB.");
     } else {
-        console.log(">>> DB not configured, skipping persistent save.");
+        logJob("DB skipped (not configured).");
     }
     
-    console.log(`>>> [JOB COMPLETE] ${timeLabel} finished successfully.`);
+    finishJob(true);
 
   } catch (e) {
-    console.error(`>>> [JOB FAILED] ${timeLabel} Error:`, e);
+    logJob(`FATAL ERROR: ${e.message}`);
+    finishJob(false, e.message);
   }
 }
 
-// --- Cron Schedules (UTC Time) ---
-cron.schedule('0 0 * * *', () => runJob(true)); // 8:00 AM CST
-cron.schedule('0 6 * * *', () => runJob(false)); // 2:00 PM CST
+// --- Schedules ---
+cron.schedule('0 0 * * *', () => runJob(true)); 
+cron.schedule('0 6 * * *', () => runJob(false)); 
 
-// --- API Routes ---
+// --- API ---
 
 app.get('/', (req, res) => res.send('AI News Backend Active.'));
-app.get('/health', (req, res) => res.status(200).send('OK'));
+
+app.get('/api/debug', (req, res) => {
+    res.json({
+        uptime: process.uptime(),
+        env: {
+            hasApiKey: !!process.env.API_KEY,
+            hasDb: !!process.env.DATABASE_URL
+        },
+        jobHistory: jobHistory
+    });
+});
 
 app.get('/api/latest', async (req, res) => {
   try {
-    // Priority 1: Try DB
+    // 1. DB
     if (pool) {
         try {
             const result = await pool.query('SELECT * FROM briefings ORDER BY created_at DESC LIMIT 1');
             if (result.rows.length > 0) {
-                 // Ensure valid JSON
                  const content = typeof result.rows[0].content === 'string' 
                     ? JSON.parse(result.rows[0].content) 
                     : result.rows[0].content;
                  return res.json(content);
             }
         } catch (dbErr) {
-            console.error("DB Read Error (falling back):", dbErr.message);
-            // Don't error out, fall through to memory cache
+            console.error("DB Read Error:", dbErr.message);
         }
     }
 
-    // Priority 2: Memory Cache
-    if (inMemoryCache && inMemoryCache.length > 0) {
-        return res.json(inMemoryCache);
-    }
-
-    // Priority 3: Empty (Valid 200 response, not 500)
-    return res.json([]); 
+    // 2. Cache (Always returns at least the default system status if empty)
+    return res.json(inMemoryCache);
 
   } catch (e) {
-    console.error("API Fatal Error:", e);
     res.status(500).send("Internal Server Error: " + e.message);
   }
 });
 
 app.post('/api/trigger', async (req, res) => {
-    console.log(">>> [TRIGGER] Received manual trigger request.");
+    console.log(">>> [TRIGGER] Request received.");
     
-    // Check if Server Key is configured
     if (!process.env.API_KEY) {
-        console.error(">>> [TRIGGER ERROR] process.env.API_KEY is missing on server.");
-        return res.status(500).send("Server Configuration Error: API_KEY missing.");
+        return res.status(500).send("Server Config Error: API_KEY missing in Railway Variables.");
     }
 
-    const authHeader = req.headers['authorization'];
-    if (!authHeader || authHeader !== process.env.API_KEY) {
-        console.warn(">>> [TRIGGER DENIED] Unauthorized access attempt.");
-        return res.status(401).send("Unauthorized: Key mismatch.");
+    // Simple auth check
+    if (req.headers['authorization'] !== process.env.API_KEY) {
+        return res.status(401).send("Unauthorized: Key Mismatch");
     }
 
-    const currentHour = new Date().getUTCHours();
-    const isMorning = currentHour < 3;
+    const isMorning = new Date().getUTCHours() < 3;
+    runJob(isMorning); 
     
-    console.log(`>>> [TRIGGER STARTING] Mode: ${isMorning ? 'AM' : 'PM'}`);
-    
-    // Run async, don't await
-    runJob(isMorning);
-    
-    res.send(`Job started in background (Mode: ${isMorning ? 'AM' : 'PM'}). Check server logs.`);
+    res.send("Job started in background. Check /api/debug.");
 });
 
 const PORT = process.env.PORT || 3000;
